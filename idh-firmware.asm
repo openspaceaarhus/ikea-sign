@@ -41,7 +41,7 @@
 ;
 ; Modifications:
 ; * The RA5(RX) pin is normally unconnected, but has an emulated RS232
-;   receiver, operating at 2400 Baud 8N1.
+;   receiver, operating at 1200 Baud 8N1.
 ; * The IND[1..4] pins are normally unconnected, but are used as feedback
 ;   indicators (put some LEDs on them, please). IND[0..2] indicate the
 ;   running mode (binary encoded) and IND4 blinks on RS232 receive.
@@ -127,11 +127,13 @@
 ; The following define, if set, disables nop insertions which align
 ; jump-tables. If unset, misalignments will create runtime problems.
 ; The test *only* works in absolute assembly mode.
-;TEST_ALIGNMENT	equ	1
+TEST_ALIGNMENT		equ	1
+; Remove the alignment NOPs when defined (used for re-alignment)
+REMOVE_ALIGNMENT	equ	1
 ;
 ; If you get errors, check the list-file and see which jump-table is
 ; out of alignment and fix it by inserting code like:
-;IFNDEF TEST_ALIGNMENT	; {
+;IFNDEF REMOVE_ALIGNMENT	; {
 ;		nop		; Alignment for the xyz jump-table
 ;		nop
 ;		nop
@@ -142,7 +144,20 @@ IFNDEF COD		; {
  ERROR "Testing alignment only works in absolute assembly mode"
 ENDIF			; }
 ENDIF			; }
-
+;
+;------------------------------------------------------------------------------
+; Limit ADC range
+; The original DIODER limits the analog input to 0..4V.
+; Limiting the range here makes calculations easier as the range
+; is recalculated to fill the 10-bit ADC range at 4V.
+LIMIT_ADC_RANGE		equ	1
+;
+;------------------------------------------------------------------------------
+; Baudrate setting
+; Must be either 1200 or 2400 (bordercase posssible)
+; See bottom of ISR routine for timing details.
+#define BAUDRATE	1200
+;
 ;------------------------------------------------------------------------------
 ; Fake any writes to the eeprom is defined
 ; (FIXME: must be set until the eeprom code is fixed)
@@ -150,8 +165,8 @@ FAKEEEPROM	equ	1	; Fake the eeprom
 ;
 ;------------------------------------------------------------------------------
 ;
-	list		p=16f684
-	;list		p=16f690
+	;list		p=16f684
+	list		p=16f690
 	errorlevel	1
 	radix		dec
 
@@ -311,10 +326,18 @@ eeprom_fixed_value	equ	0x0c
 eeprom_fixed_saturation	equ	0x0d
 
 ;
-; The fastest possible is 2400 Baud. Any faster will skew the bit sampling
-; too much and we miss the data.
-FIRST_BIT_TIME	equ	(-57)	; 1.1 bit delay at 2400 Baud
-NEXT_BIT_TIME	equ	(-52)	; 1.0 bit delay at 2400 Baud
+; The fastest possible guaranteed speed is 1200 Baud. Higher, at 2400 works,
+; but there is a border case that may lose the bit timing. Any faster than
+; 2400 will skew the bit sampling too much and we miss the data.
+IF (BAUDRATE == 1200)	; {
+FIRST_BIT_TIME	equ	(-108)	; 1.037 bit delay at 1200 Baud
+NEXT_BIT_TIME	equ	(-104)	; 0.9984 bit delay at 1200 Baud (plus overhead gets to > 1.0)
+ELSE	; }{
+IF (BAUDRATE == 2400)	; {
+FIRST_BIT_TIME	equ	(-54)	; 1.037 bit delay at 2400 Baud
+NEXT_BIT_TIME	equ	(-52)	; 0.9984 bit delay at 2400 Baud (plus overhead gets to > 1.0)
+ENDIF			; }
+ENDIF			; }
 
 SEXTSIZE	equ	((1 << 8) + 1)
 SEXT0		equ	(0 * SEXTSIZE)
@@ -327,6 +350,11 @@ MAX_HUE		equ	(6 * SEXTSIZE - 1)
 MAX_VALUE	equ	255
 MAX_SATURATION	equ	255
 
+; Timer2 period register setting
+; See below at bottom of ISR routine for timing overhead.
+;TIMER2_PERIOD	equ	156	; 156 counts -> 12820.51/256 -> pwm:50.1Hz
+;TIMER2_PERIOD	equ	140	; 140 counts -> 14285.71/256 -> pwm:55.8Hz
+TIMER2_PERIOD	equ	130	; 130 counts -> 15384.61/256 -> pwm:60.1Hz
 ;
 ; Code origin
 ;
@@ -342,23 +370,25 @@ ENDIF		; }
 ;
 ;------------------------------------------------------------------------------
 ; Interrupt service routine
-; The isr should run in less than 156 clocks or timer2 will fire again
+; The isr should run in less than TIMER2_PERIOD clocks or timer2 will fire again
 ;------------------------------------------------------------------------------
 ;
 		org	0x04
 _isr
+						; ()
 		movwf	isr_wsave
 		swapf	STATUS, w
-		movwf	isr_ssave
+		movwf	isr_ssave		; (3)
 
 ;----- Timer2 handling -----
 
-		banksel	PIR1
+		banksel	PIR1			; ()
 		btfss	PIR1, TMR2IF		; TMR2IF
 		goto	no_tmr2
 		bcf	PIR1, TMR2IF		; Clear TMR2IF
+						; (4)
 
-		clrf	isr_tmp
+		clrf	isr_tmp			; ()
 		incf	_pwm_r, f		; Round-robin PWM counter
 		incf	_pwm_g, f		; Round-robin PWM counter
 		incf	_pwm_b, f		; Round-robin PWM counter
@@ -380,9 +410,9 @@ _isr
 		bsf	isr_tmp, BITBLUE
 
 		movf	isr_tmp, w		; Set the LED outputs simultaneously
-		movwf	PORTA
+		movwf	PORTA			; (18)
 
-		; Check the serial input
+		; Check the serial input	; ()
 		movf	_bitrxcnt, w		; Only check if not currently receiving
 		btfss	STATUS, Z
 		goto	no_startbit
@@ -397,26 +427,27 @@ _isr
 		movlw	9
 		movwf	_bitrxcnt
 		bsf	PORTC, BITIND4		; Set the receive indicator
+						; (12)
 
-no_startbit
+no_startbit	; (4,5)
 		; Check the buttons and debounce
 		; if(~button ^ flag == 0)
 		;	dbcnt = 0;
 		; if(!--dbcnt)
 		;	flag = ~button;
-		comf	PORTA, w
+		comf	PORTA, w		; ()
 		xorwf	_flags, w
-		andlw	(1 << BITS1)	; if((~PORTA ^ _flags) & (1 << BITS1) == 0)
+		andlw	(1 << BITS1)		; if((~PORTA ^ _flags) & (1 << BITS1) == 0)
 		btfsc	STATUS, Z
-		clrf	_dbs1		;	_dbs1 = 0
-		decf	_dbs1, f	; if(!--_dbs1)
+		clrf	_dbs1			;	_dbs1 = 0
+		decf	_dbs1, f		; if(!--_dbs1)
 		btfss	STATUS, Z
-		goto	no_change_s1	; false-clause -> skip to next button
-		bsf	_flags, BIT_S1	; true-clause -> reversed flag: buttons active low
+		goto	no_change_s1		; false-clause -> skip to next button
+		bsf	_flags, BIT_S1		; true-clause -> reversed flag: buttons active low
 		btfsc	PORTA, BITS1
-		bcf	_flags, BIT_S1
+		bcf	_flags, BIT_S1		; (9, 11)
 no_change_s1
-		comf	PORTA, w
+		comf	PORTA, w		; ()
 		xorwf	_flags, w
 		andlw	(1 << BIT_S2)
 		btfsc	STATUS, Z
@@ -426,9 +457,9 @@ no_change_s1
 		goto	no_change_s2
 		bsf	_flags, BIT_S2
 		btfsc	PORTA, BITS2
-		bcf	_flags, BIT_S2
+		bcf	_flags, BIT_S2		; (9, 11)
 no_change_s2
-		comf	PORTC, w
+		comf	PORTC, w		; ()
 		xorwf	_flags, w
 		andlw	(1 << BIT_S3)
 		btfsc	STATUS, Z
@@ -438,26 +469,31 @@ no_change_s2
 		goto	no_change_s3
 		bsf	_flags, BIT_S3
 		btfsc	PORTC, BITS3
-		bcf	_flags, BIT_S3
+		bcf	_flags, BIT_S3		; (9,11)
 no_change_s3
 no_tmr2
+		; Timer2 handling cycles:
+		; - not fired:	4
+		; - fired:	52..55+4..5 = 56..60
+		; - startbit:	52..55+12 = 64..67
 
 ;----- Timer0 handling -----
-
+						; ()
 		btfss	INTCON, T0IE		; Do we have timer0 enable?
 		goto	no_tmr0
 		btfss	INTCON, T0IF		; Do we have timer0 interrupt?
 		goto	no_tmr0
-
+						; (4)
+						; ()
 		movlw	NEXT_BIT_TIME		; Set Timer0 to fire at next bit
 		movwf	TMR0
 		bcf	INTCON, T0IF		; Clear TMR0IF
-
+						; (3)
 		; if(_bitrxcnt > 1)
 		;  read bit
 		; else
 		;  check stop bit
-		movf	_bitrxcnt, w
+		movf	_bitrxcnt, w		; ()
 		sublw	1			; 1 - _bitrxcnt
 		btfsc	STATUS, C		; if(_bitrxcnt <= 1)
 		goto	check_stopbit		; 	check stopbit
@@ -478,26 +514,64 @@ check_stopbit
 		; but we don't care and the errors will continue until
 		; the line is idle for a longer period.
 		bcf	PORTC, BITIND4		; Clear the receive indicator
-		goto	done_tmr0
+		goto	done_tmr0		; (12)
 next_bit
 		decf	_bitrxcnt, f		; Have all bits?
 		btfss	STATUS, Z
 		goto	done_tmr0		; no
+						; (14)
 
-bits_done
+bits_done					; ()
 		bcf	INTCON, T0IE		; yes, clear timer0 interrupt enable
 		movf	_rxreg, w		; Move data to received data
 		btfss	_flags, BIT_RXREADY	; Don't overwrite existing data, just drop
 		movwf	_rxd
 		bsf	_flags, BIT_RXREADY	; Indicate data received
-
+						; (18)
 done_tmr0
 no_tmr0
+		; Timer0 handling cycles:
+		; not enable:	3
+		; not fired:	5
+		; fired, bit:	4+3+14 = 21
+		; fires, error: 4+3+12 = 19
+		; fired, rx:	4+3+18 = 25
+						; ()
 		swapf	isr_ssave, w
 		movwf	STATUS
 		swapf	isr_wsave, f
 		swapf	isr_wsave, w
-		retfie
+		retfie				; (6)
+		; ISR timing
+		; intro:	3
+		; timer2:	4, 56..67
+		; timer0:	3,4,19,21,25
+		; exit:		6
+		; Timer0 case: 3+4+(19,21,25)+6 = 32..38
+		; Timer2 case: 3+56..67+(3,4)+6 = 68..80
+		; Both timers: 3+(56..67)+(19..25)+6 = 84..101
+		; @50.1Hz PWM (Timer2 = 156) overhead:
+		; - isr best case:	~21%
+		; - isr avarage:	~47%
+		; - isr worst case:	~65%
+		; @55.8Hz PWM (Timer2 = 140) overhead:
+		; - isr best case:	~23%
+		; - isr avarage:	~53%
+		; - isr worst case:	~72%
+		; @60.1Hz PWM (Timer2 = 130) overhead:
+		; - isr best case:	~25%
+		; - isr avarage:	~57%
+		; - isr worst case:	~78%
+		; Worst case serial bit skew:
+		; - 9 * ~86(+2) = ~774(+18) cycles = ~387(+9)us
+		; with 416.67us per bit @2400, that means losing time of up to
+		; 93% (95%) of one bit. That means we should catch all bits
+		; reliably if the startbit is detected fast. With the next
+		; startbit detection max. at 78us (18%) away (timer2@50Hz PWM),
+		; we may fail to receive the next byte.
+		; @1200 we do not see these problems. Worst case skew @1200 is
+		; 46.5% (47.5%) and the startbit detection delay is worst case
+		; at 9.5%.
 ;
 ;------------------------------------------------------------------------------
 ; Main entry point
@@ -534,10 +608,10 @@ ENDIF	; }
 		movwf	OPTION_REG		; Enable RA pull-up, internal TMR0 clock, presclaler for TMR0, prescale 1:16
 		movlw	0x00
 		movwf	IOCA			; No interrupt-on-change
-		movlw	0x20
-		movwf	ADCON1			; ADC clock Fosc/32
-		movlw	156
-		movwf	PR2			; Timer2 period register 156 counts -> 12820.51/256 -> pwm:50.08Hz
+		movlw	01010000b
+		movwf	ADCON1			; ADC clock Fosc/16
+		movlw	TIMER2_PERIOD
+		movwf	PR2			; Timer2 period register
 IFDEF __16F690	; {
 		banksel	ANSEL
 ENDIF		; }
@@ -686,8 +760,10 @@ mode_table_start
 		goto	mode7_step
 mode_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((mode_table_end-1) ^ mode_table_start) != 0		; {
  ERROR "mode_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -760,8 +836,10 @@ modeinit_table_start
 		return				; goto	mode7_init
 modeinit_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((modeinit_table_end-1) ^ modeinit_table_start) != 0		; {
  ERROR "modeinit_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -788,6 +866,58 @@ read_adc
 		movwf	adc_lo
 		movf	ADRESH, w	; Read high A/D result
 		movwf	adc_hi
+IFDEF LIMIT_ADC_RANGE	; {
+		; The analog input of the DIODER is limited to 0...4V because
+		; the potentiometer is blocked to cover the whole turn-angle
+		; by plastic blocks.
+		; To compensate we're gonna kill the resolution to 4/5 and
+		; extend the range again to 5/4.
+		;
+		; if(adc > MAX_ADC)
+		;	adc = MAX_ADC;
+		; adc = adc * 5 / 4
+MAX_ADC		equ	(1023 * 4 / 5)
+
+		movlw	HIGH(MAX_ADC+1)
+		subwf	adc_hi, w
+		btfss	STATUS, Z
+		goto	adc_checkc
+		movlw	LOW(MAX_ADC+1)
+		subwf	adc_lo, w
+adc_checkc
+		btfss	STATUS, C
+		goto	adc_lessmax
+
+		movlw	HIGH(MAX_ADC)	; adc = MAX_ADC
+		movwf	adc_hi
+		movlw	LOW(MAX_ADC)
+		movwf	adc_lo
+adc_lessmax
+		; The adc value is now 0..MAX_ADC, calculate *5/4
+		movf	adc_lo, w
+		movwf	mul_lo
+		movf	adc_hi, w
+		movwf	mul_hi
+		bcf	STATUS, C
+		rlf	adc_lo, f	; *4
+		rlf	adc_hi, f
+		rlf	adc_lo, f
+		rlf	adc_hi, f
+
+		movf	mul_lo, w	; *(4+1)
+		addwf	adc_lo, f
+		movf	mul_hi, w
+		btfsc	STATUS, C
+		addlw	1
+		addwf	adc_hi, f
+
+		bcf	STATUS, C
+		rrf	adc_hi, f	; *(4+1)/4
+		rrf	adc_lo, f
+		bcf	STATUS, C
+		rrf	adc_hi, f
+		rrf	adc_lo, f
+ENDIF	; }
 		return
 ;
 ;------------------------------------------------------------------------------
@@ -961,8 +1091,10 @@ step_r_table_start
 		make_step_r	0
 step_r_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((step_r_table_end-1) ^ step_r_table_start) != 0	; {
  ERROR "step_r_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -979,8 +1111,10 @@ step_g_table_start
 		make_step_g	0
 step_g_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((step_g_table_end-1) ^ step_g_table_start) != 0	; {
  ERROR "step_g_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -997,8 +1131,10 @@ step_b_table_start
 		make_step_b	0
 step_b_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((step_b_table_end-1) ^ step_b_table_start) != 0	; {
  ERROR "step_b_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 ;
@@ -1027,7 +1163,7 @@ fixed_init
 		goto	_hsv_to_rgb		; Activate
 
 fixed_step
-		movf	_flags, w		; Check if S1/S3 are pressed
+		movf	_flags, w		; Check if S1 or S3 are pressed
 		movwf	mul_tmp			; save for later use (interrupts may change the flags)
 		andlw	(1<<BIT_SET_HUE) | (1<<BIT_SET_SAT)
 		btfsc	STATUS, Z
@@ -1035,9 +1171,9 @@ fixed_step
 
 		call	read_adc		; Get the current wheel position
 
-		btfss	mul_tmp, BIT_SET_SAT
-		goto	fixed_set_saturation
 		btfss	mul_tmp, BIT_SET_HUE
+		goto	fixed_set_saturation
+		btfss	mul_tmp, BIT_SET_SAT
 		goto	fixed_set_hue
 
 		; else set value
@@ -1146,8 +1282,8 @@ rand_set_rgb
 ; Handle serial input
 ;------------------------------------------------------------------------------
 ;
-IFNDEF TEST_ALIGNMENT	; {
-		nop		; Alignment for the xyz jump-table
+IFNDEF REMOVE_ALIGNMENT	; {
+		nop
 		nop
 		nop
 		nop
@@ -1187,8 +1323,10 @@ rx_table_start
 		goto	rx_setvalue
 rx_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((rx_table_end-1) ^ rx_table_start) != 0	; {
  ERROR "rx_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -1218,8 +1356,10 @@ rx_special_table_start
 		return				; this is a NOP
 rx_special_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((rx_special_table_end-1) ^ rx_special_table_start) != 0	; {
  ERROR "rx_special_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -1421,8 +1561,10 @@ rampage_table_start
 		goto	rampage_rdb
 rampage_table_end
 IFDEF COD	; {
+IFDEF TEST_ALIGNMENT	; {
 IF HIGH((rampage_table_end-1) ^ rampage_table_start) != 0	; {
  ERROR "rampage_table crosses page boundary"
+ENDIF		; }
 ENDIF		; }
 ENDIF		; }
 
@@ -1589,6 +1731,8 @@ wheel_set
 ; V [0..255]
 ;
 ;	frac = h;
+;	if(!saturation)
+;		saturation++;	/* This fixes border case, marked !! below */
 ;	if(h < 257) {
 ;		frac -= 0;
 ;		red   = v;
@@ -1787,6 +1931,8 @@ hsv_st5
 ;
 hsv_ns1_mul_v
 		movf	saturation, w		; s
+		btfsc	STATUS, Z		; !!
+		addlw	1			; !!
 		xorlw	0xff			; ~s
 		addlw	1			; (~s + 1)
 		goto	hsv_mul_v
@@ -1815,6 +1961,8 @@ hsv_nsfrac_mul_v
 		movwf	mul_hi
 hsv_domul
 		movf	saturation, w
+		btfsc	STATUS, Z	; !!
+		addlw	1		; !!
 		call	mult_8x16	; mul * s
 		movf	res_hi, w	; low(x >> 8) == high(x)
 		xorlw	0xff
