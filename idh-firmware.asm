@@ -1,6 +1,8 @@
+; vim: syn=pic
+;
 ; Ikea DIODER hack
 ; Copyright (C) 2011  B. Stultiens
-
+;
 ; This program is free software: you can redistribute it and/or modify
 ; it under the terms of the GNU General Public License as published by
 ; the Free Software Foundation, either version 3 of the License, or
@@ -112,6 +114,8 @@
 ;			*    S1	set saturation
 ; - serial	Only serial input changes the colors
 ; 
+; The settings for each mode are automatically saved in eeprom. To save the
+; running mode at startup press S1+S3 and then press S2.
 ;
 ;------------------------------------------------------------------------------
 ; Source code configuration defines
@@ -127,9 +131,9 @@
 ; The following define, if set, disables nop insertions which align
 ; jump-tables. If unset, misalignments will create runtime problems.
 ; The test *only* works in absolute assembly mode.
-TEST_ALIGNMENT		equ	1
+#define TEST_ALIGNMENT		1
 ; Remove the alignment NOPs when defined (used for re-alignment)
-REMOVE_ALIGNMENT	equ	1
+#define REMOVE_ALIGNMENT	1
 ;
 ; If you get errors, check the list-file and see which jump-table is
 ; out of alignment and fix it by inserting code like:
@@ -150,23 +154,25 @@ ENDIF			; }
 ; The original DIODER limits the analog input to 0..4V.
 ; Limiting the range here makes calculations easier as the range
 ; is recalculated to fill the 10-bit ADC range at 4V.
-LIMIT_ADC_RANGE		equ	1
+#define LIMIT_ADC_RANGE		1
 ;
 ;------------------------------------------------------------------------------
 ; Baudrate setting
-; Must be either 1200 or 2400 (bordercase posssible)
+; Must be either 1200 or 2400 (borderline posssible)
 ; See bottom of ISR routine for timing details.
-#define BAUDRATE	1200
+#define BAUDRATE		1200
 ;
 ;------------------------------------------------------------------------------
 ; Fake any writes to the eeprom is defined
 ; (FIXME: must be set until the eeprom code is fixed)
-FAKEEEPROM	equ	1	; Fake the eeprom
+;#define FAKEEEPROM		1
 ;
 ;------------------------------------------------------------------------------
+; Define to use the watchdog timer
+#define USEWDT			1
+;------------------------------------------------------------------------------
 ;
-	;list		p=16f684
-	list		p=16f690
+	list
 	errorlevel	1
 	radix		dec
 
@@ -232,6 +238,18 @@ ovr_data_start
 isr_ssave	res	1	; ISR: Status reg save
 isr_wsave	res	1	; ISR: W reg save
 isr_tmp		res	1	; ISR: temp variable
+ee_tmp		res	1	; Temporary eeprom address store
+ovr_data_end
+IF (ovr_data_end - ovr_data_start) > 16	; {
+ ERROR "Shared data size overflow"
+ENDIF		; }
+
+; Running variables
+IFDEF COD	; {
+		org	0x0020
+ELSE		; }{
+databank	udata		0x0020
+ENDIF		; }
 _pwm_r		res	1	; PWM counter red channel
 _pwm_g		res	1	; PWM counter green channel
 _pwm_b		res	1	; PWM counter blue channel
@@ -245,17 +263,7 @@ _flags		res	1	; Flags from the ISR to main to indicate input
 _dbs1		res	1	; Debounce counter S1
 _dbs2		res	1	; Debounce counter S2
 _dbs3		res	1	; Debounce counter S3
-ovr_data_end
-IF (ovr_data_end - ovr_data_start) > 16	; {
- ERROR "Shared data size overflow"
-ENDIF		; }
 
-; Running variables
-IFDEF COD	; {
-		org	0x0020
-ELSE		; }{
-databank	udata		0x0020
-ENDIF		; }
 hue_lo		res	1	; HSV colorspace
 hue_hi		res	1
 value		res	1
@@ -317,7 +325,7 @@ eeprom_step_speed	equ	0x03
 eeprom_step_dir		equ	0x04
 eeprom_random_speed	equ	0x05
 eeprom_wheel_speed	equ	0x06
-eeprom_wheel_dir	equ	0x07
+eeprom_wheel_dir	equ	eeprom_step_dir	; (should be 0x07) We have no buttons left to set this...
 eeprom_wheel_value	equ	0x08
 eeprom_wheel_saturation	equ	0x09
 eeprom_fixed_hue_lo	equ	0x0a
@@ -380,9 +388,11 @@ _isr
 		swapf	STATUS, w
 		movwf	isr_ssave		; (3)
 
+		banksel	0			; All our vars and regs reside in bank 0
+
 ;----- Timer2 handling -----
 
-		banksel	PIR1			; ()
+						; ()
 		btfss	PIR1, TMR2IF		; TMR2IF
 		goto	no_tmr2
 		bcf	PIR1, TMR2IF		; Clear TMR2IF
@@ -605,6 +615,7 @@ ENDIF	; }
 		movlw	0x20
 		movwf	WPUA			; RA5 week pull-up enable
 		movlw	0x03
+		clrwdt				; pic16f684 Errata.1
 		movwf	OPTION_REG		; Enable RA pull-up, internal TMR0 clock, presclaler for TMR0, prescale 1:16
 		movlw	0x00
 		movwf	IOCA			; No interrupt-on-change
@@ -665,18 +676,6 @@ clear_ram_b0
 		movwf	rand_1
 		movlw	0xef
 		movwf	rand_0
-
-		movlw	0xe0
-		movwf	speed			; Fast start
-
-		movlw	0xff			; Set the default color at startup
-		movwf	value
-		movwf	saturation
-		movlw	LOW(MAX_HUE)
-		movwf	hue_lo
-		movlw	HIGH(MAX_HUE)
-		movwf	hue_hi
-		call	_hsv_to_rgb
 
 		movlw	0xc0			; Enable global and peripheral interrupts
 		iorwf	INTCON, f
@@ -756,7 +755,7 @@ mode_table_start
 		goto	random_step
 		goto	wheel_step
 		goto	fixed_step
-		return					; goto	serial_step
+		return				; goto	serial_step
 		goto	mode7_step
 mode_table_end
 IFDEF COD	; {
@@ -779,21 +778,6 @@ ENDIF		; }
 ;		return
 ;
 ;------------------------------------------------------------------------------
-; Mode 7
-;------------------------------------------------------------------------------
-;
-;mode7_init
-;		return
-;
-mode7_step
-		; Not implemented, yet
-		; set off mode for now
-		movlw	MODE_OFF
-		movwf	runmode
-		goto	restore_mode_init
-
-;
-;------------------------------------------------------------------------------
 ; S2 button handling
 ; Called when a S2 state-change is detected
 ;------------------------------------------------------------------------------
@@ -805,9 +789,19 @@ handle_set_mode
 		return
 handle_set_mode_on
 		bsf	buttonstate, BIT_SET_MODE
-		; Safe current state
-		; FIXME
 
+		; If S1 and S3 are pressed too, save the runmode to eeprom
+		btfss	_flags, BIT_S1
+		goto	do_set_mode
+		btfss	_flags, BIT_S3
+		goto	do_set_mode
+		; Now all three buttons are pressed
+		movf	runmode, w		; Startup mode data in FSR
+		movwf	FSR
+		movlw	eeprom_startup_mode	; Eeprom address in Wreg
+		goto	eeprom_write		; Save the mode and return
+
+do_set_mode
 		; Advance to next state
 		movf	runmode, w		; Advance to next mode
 		addlw	1
@@ -850,6 +844,21 @@ show_mode
 		movf	runmode, w
 		iorwf	PORTC, f
 		return
+;
+;------------------------------------------------------------------------------
+; Mode 7
+;------------------------------------------------------------------------------
+;
+;mode7_init
+;		return
+;
+mode7_step
+		; Not implemented, yet
+		; set off mode for now
+		movlw	MODE_OFF
+		movwf	runmode
+		goto	restore_mode_init
+
 ;
 ;------------------------------------------------------------------------------
 ; Read the ADC channel 7
@@ -1669,6 +1678,7 @@ wheel_step
 
 		; Here both buttons are pressed -> set value
 		movwf	value
+		; FIXME: eeprom save
 		goto	wheel_move
 
 wheel_set_speed
@@ -1678,6 +1688,7 @@ wheel_set_speed
 
 wheel_set_sat
 		movwf	saturation
+		; FIXME: eeprom save
 		; FALLTHROUGH
 wheel_move
 		btfss	_flags, BIT_DIR
@@ -2050,21 +2061,27 @@ ELSE			; }{
 ;------------------------------------------------------------------------------
 ;
 eeprom_read
+IFDEF __16F684	; {
 		banksel	EEADR
 		movwf	EEADR		; Set address
-IFDEF __16F690	; {
-		banksel	EECON1
-		bcf	EECON1, EEPGD
-ENDIF		; }
 		bsf	EECON1, RD	; Read
-
-IFDEF __16F690	; {
-		banksel	EEDAT
-ENDIF		; }
 		movf	EEDAT, w	; Get the data
 		banksel	0
-		return
 
+ELSE		; }{
+
+IFDEF __16F690	; {
+		banksel	EEADR
+		movwf	EEADR		; Set address
+		banksel	EECON1
+		bcf	EECON1, EEPGD
+		bsf	EECON1, RD	; Read
+		banksel	EEDAT
+		movf	EEDAT, w	; Get the data
+		banksel	0
+ENDIF		; }
+ENDIF		; }
+		return
 ;
 ;------------------------------------------------------------------------------
 ; Write eeprom value
@@ -2072,57 +2089,69 @@ ENDIF		; }
 ;------------------------------------------------------------------------------
 ;
 eeprom_write
-		movwf	mul_tmp		; Save address
-;		call	eeprom_read
-;		subwf	FSR, w		; Check is data is same
-;		btfsc	STATUS, Z
-;		return
+		movwf	ee_tmp		; Save address
+		call	eeprom_read
+		xorwf	FSR, w		; Check is data is same
+		btfsc	STATUS, Z
+		return
+
+		clrwdt			; Kick, gives us ~0.5s
 
 		banksel	EEADR
-		movf	mul_tmp, w
+		movf	ee_tmp, w
 		movwf	EEADR		; Set address
 		movf	FSR, w
 		movwf	EEDAT		; Set data
+
 IFDEF __16F684	; {
-		banksel	PIR1
-		bcf	PIR1, EEIF
-ENDIF		; }
-IFDEF __16F690	; {
-		banksel	PIR2
-		bcf	PIR2, EEIF
-		banksel	EECON1
-		bcf	EECON1, EEPGD
-ENDIF		; }
 		bsf	EECON1, WREN	; Write enable
 
 		bcf	INTCON, GIE	; Disable interrupts
 		btfsc	INTCON, GIE	; See AN576, must ensure disable
 		goto	$-2
 
-		movlw	0x55
+		movlw	0x55		; Write enable sequence
 		movwf	EECON2
 		movlw	0xaa
 		movwf	EECON2
 		bsf	EECON1, WR
 		bsf	INTCON, GIE
 		; Wait for the write to complete
-IFDEF __16F690	; {
-		banksel	PIR2
-		btfss	PIR2, EEIF
+		; See pic16f684 Errata.2
+		btfsc	EECON1, WR
 		goto	$-1
-		bcf	PIR2, EEIF
-ENDIF		; }
-IFDEF __16F684	; {
-		banksel	PIR1
-		btfss	PIR1, EEIF
-		goto	$-1
-		bcf	PIR1, EEIF
-ENDIF		; }
 
-		banksel	EECON1
 		bcf	EECON1, WREN
 		banksel	0
 		return
+ELSE		; }{
+
+IFDEF __16F690	; {
+		banksel	EECON1
+		bcf	EECON1, EEPGD
+		bsf	EECON1, WREN	; Write enable
+
+		bcf	INTCON, GIE	; Disable interrupts
+		btfsc	INTCON, GIE	; See AN576, must ensure disable
+		goto	$-2
+
+		movlw	0x55		; Write enable sequence
+		movwf	EECON2
+		movlw	0xaa
+		movwf	EECON2
+		bsf	EECON1, WR
+		nop
+		bsf	INTCON, GIE
+		; Wait for the write to complete
+		btfsc	EECON1, WR
+		goto	$-1
+
+		bcf	EECON1, WREN
+		banksel	0
+		return
+ENDIF		; }
+ENDIF		; }
+
 ENDIF			; }
 ;
 ;------------------------------------------------------------------------------
