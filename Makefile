@@ -1,18 +1,32 @@
 CFLAGS=-Wall -O2
 
-COD=1
+# For absolute mode
+COD=-DCOD=1
 
-taget: idh-firmware.hex idh-serial
+TARGETS=\
+	idh-firmware-16f690.hex \
+	idh-firmware-16f684.hex \
+	idh-serial
 
-ifeq ($(COD),1)
-idh-firmware.hex: idh-firmware.asm
-	gpasm -DCOD=1 -o $@ $<
-else
-idh-firmware.hex: idh-firmware.o
-	gplink -m -o $@ $<
+ASMSRC=idh-firmware.asm
 
-idh-firmware.o: idh-firmware.asm
-	gpasm -c -o $@ $<
-endif
+all: $(TARGETS)
+
+idh-firmware-16f684.hex: $(ASMSRC)
+	gpasm $(COD) -p16f684 -o $@ $<
+
+idh-firmware-16f690.hex: $(ASMSRC)
+	gpasm $(COD) -p16f690 -o $@ $<
+
+#.o.hex:
+#	gplink -m -o $@ $<
+#
+#.asm.o:
+#	gpasm -c -o $@ $<
+
 
 idh-serial: idh-serial.c
+
+
+clean:
+	$(RM) $(TARGETS) $(TARGETS:.hex=.lst) $(TARGETS:.hex=.cod)

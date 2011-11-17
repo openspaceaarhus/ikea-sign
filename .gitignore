@@ -1,5 +1,5 @@
-idh-firmware.cod
-idh-firmware.hex
-idh-firmware.lst
+*.cod
+*.hex
+*.lst
 ikea-dioder-control.ps
 ikea-dioder-control.pdf
