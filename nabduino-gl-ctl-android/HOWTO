@@ -1,0 +1,7 @@
+How do you build this project?
+
+1. Copy all the source files from nabduino-gl-ctl/ to jni/src
+2. Copy all the data files from nabduino-gl-ctl/data to assets/data
+3. Generate a my-release-key.keystore according to standard Android procedures (http://developer.android.com/guide/publishing/app-signing.html)
+4. Type ndk-build
+5. Type ant release
